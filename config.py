@@ -55,3 +55,10 @@ MONGO_URI = os.getenv("MONGO_URI", "").strip()
 MONGO_DB = os.getenv("MONGO_DB", "").strip() or "AnimePipeline"
 PIPELINE_DELAY = float(os.getenv("PIPELINE_DELAY", "8"))                          # seconds to rest between episodes
 PIPELINE_SOURCE = os.getenv("PIPELINE_SOURCE", "").strip() or "hentai-series/"    # what the site's home link means
+# ---- post channel thumbnail: blur only the detected sensitive areas (NudeNet)
+BLUR_ENABLED = os.getenv("BLUR_ENABLED", "true").strip().lower() != "false"
+BLUR_CONF = float(os.getenv("BLUR_CONF", "0.25"))      # lower = blurs more (detector is trained on photos, anime may need ~0.25)
+BLUR_PAD = float(os.getenv("BLUR_PAD", "0.15"))        # extra margin around each area, as a fraction of its size
+BLUR_LABELS = {x for x in os.getenv(
+    "BLUR_LABELS", "FEMALE_GENITALIA_EXPOSED,MALE_GENITALIA_EXPOSED,ANUS_EXPOSED,FEMALE_BREAST_EXPOSED,BUTTOCKS_EXPOSED"
+).replace(" ", "").split(",") if x}

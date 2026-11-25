@@ -21,7 +21,10 @@ from pyrogram import enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+import config
 import templating as T
+from blur import blur_image
+from userbot_links import generate_links
 
 log = logging.getLogger("pipeline")
 HTML = enums.ParseMode.HTML
@@ -102,6 +105,7 @@ class Pipeline:
         self.loop_task = None
         self.current = {}   # task id -> what it is doing right now
         self.sess = {}      # (task id, series url) -> browser session for poster downloads
+        self.bulk = {}      # task id -> state of a bulk link run
 
     # ---- control (used by the bot's commands)
     async def start_loop(self):
@@ -351,22 +355,237 @@ class Pipeline:
         if not files:
             raise Exception("no quality could be uploaded (all over 2 GB or failed)")
 
-        if not ep.get("ep_msg"):
+        if task.get("link_bot1"):
+            await self._make_links(task, ep, files, ep_num, base)
+
+        need_post = bool(task.get("post_channel")) and not ep.get("post_msg")
+        need_ep = not ep.get("ep_msg")
+        if need_post or need_ep:
             vals = {**base, "episode": ep_num, "quality": " · ".join(f["label"] for f in files),
                     "size": " · ".join(human_size(f["size"]) for f in files), "ep_title": emeta.get("title") or ""}
             text = T.render(await self.db.template("episode"), vals)
-            kb = [[InlineKeyboardButton("⬇️ Download" if len(files) == 1 else f"⬇️ Download {f['label']}", url=f["link"])]
-                  for f in files]
             img, d = await self._image(emeta.get("image"), res)
             try:
-                msg, _ = await self._send_post(ech, text, img, InlineKeyboardMarkup(kb))
+                if need_post:  # post channel: same post, the button is the generated link
+                    kb = [[InlineKeyboardButton("🔗 Generate Link" if len(files) == 1 else f"🔗 Generate Link {f['label']}",
+                                                url=f.get("link2") or f.get("link1") or f["link"])] for f in files]
+                    pimg = await self._blur(img, d) if img else None   # post channel: sensitive areas blurred
+                    msg, _ = await self._send_post(task["post_channel"], text, pimg, InlineKeyboardMarkup(kb))
+                    ep["post_msg"] = msg.id
+                    await self.db.set_episode(tid, url, post_msg=msg.id)
+                if need_ep:
+                    kb = [[InlineKeyboardButton("⬇️ Download" if len(files) == 1 else f"⬇️ Download {f['label']}", url=f["link"])]
+                          for f in files]
+                    msg, _ = await self._send_post(ech, text, img, InlineKeyboardMarkup(kb))
+                    ep["ep_msg"] = msg.id
+                    await self.db.set_episode(tid, url, ep_msg=msg.id)
             finally:
                 if d:
                     shutil.rmtree(d, ignore_errors=True)
-            await self.db.set_episode(tid, url, ep_msg=msg.id)
         await self.db.set_episode(tid, url, status="done", error=None)
         if srow:
             await self._refresh_sub_post(task, srow["url"])
+
+    # ---- bulk links: files that were posted before link generation was turned on
+    @staticmethod
+    def _link_kb(files):
+        return InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🔗 Generate Link" if len(files) == 1 else f"🔗 Generate Link {f['label']}",
+            url=f.get("link2") or f.get("link1") or f["link"])] for f in files])
+
+    async def bulk_plan(self, tid, first, last):
+        """Finished episodes that have a file whose file-channel message id is in [first, last], in upload order."""
+        task = await self.db.task(tid)
+        fid = task["file_channel"]["id"]
+        docs = await self.db.eps.find({"task": tid, "status": "done", "files": {"$elemMatch": {
+            "chat": fid, "msg": {"$gte": first, "$lte": last}}}}).to_list(None)
+        docs.sort(key=lambda e: min(f["msg"] for f in e["files"] if first <= f["msg"] <= last))
+        return docs
+
+    async def bulk_start(self, tid, first, last, chat_id, msg_id, force=True):
+        old = self.bulk.get(tid)
+        if old and not old["finished"]:
+            raise RuntimeError("a bulk run is already going for this task")
+        eps = await self.bulk_plan(tid, first, last)
+        st = {"total": len(eps), "done": 0, "failed": [], "cur": "starting", "stop": False, "finished": False,
+              "aborted": None, "force": force, "cap_ok": 0, "cap_fail": 0, "cap_err": ""}
+        self.bulk[tid] = st
+        st["job"] = asyncio.create_task(self._bulk_run(tid, eps, st, chat_id, msg_id))
+        return st
+
+    def bulk_stop(self, tid):
+        st = self.bulk.get(tid)
+        if st and not st["finished"]:
+            st["stop"] = True
+            return True
+        return False
+
+    async def _bulk_run(self, tid, eps, st, chat_id, msg_id):
+        task = await self.db.task(tid)
+        last_edit, streak = 0.0, 0
+
+        async def show():
+            head = ("✅ Done" if not st["stop"] and not st["aborted"] else "⏹ Stopped") if st["finished"] else "⏳ Running"
+            txt = (f"🔗 <b>Bulk links · task #{tid}</b> — {head}\nEpisodes: {st['done']}/{st['total']}"
+                   f" · failed {len(st['failed'])}\nFile captions: {st['cap_ok']} updated · {st['cap_fail']} failed")
+            if st["cap_err"]:
+                txt += f"\n⚠️ Caption error: {T.html.escape(st['cap_err'])}"
+            if not st["finished"]:
+                txt += f"\nNow: {T.html.escape(st['cur'])}"
+            if st["aborted"]:
+                txt += f"\n⚠️ Stopped after repeated errors: {T.html.escape(st['aborted'])}"
+            if st["failed"]:
+                txt += "\n" + "\n".join("• " + T.html.escape(x) for x in st["failed"][-5:])
+            if st["finished"] and st["failed"]:
+                txt += "\nRun it again with the same range to retry the failed ones."
+            kb = None if st["finished"] else InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Stop", callback_data=f"bk|stop|{tid}")]])
+            try:
+                await self.app.edit_message_text(chat_id, msg_id, txt, parse_mode=HTML, reply_markup=kb)
+            except Exception as e:
+                if "NOT_MODIFIED" not in str(e).upper():
+                    log.warning("bulk progress edit failed: %s", e)
+
+        try:
+            for e0 in eps:
+                if st["stop"]:
+                    break
+                ep = await self.db.episode(tid, e0["url"]) or e0
+                num = str(ep["n"]) if ep.get("n") is not None else (ep.get("label") or "?")
+                st["cur"] = f"EP {num}"
+                try:
+                    await self._bulk_episode(task, ep, num, st)
+                    st["done"] += 1
+                    streak = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.exception("bulk episode failed: %s", ep["url"])
+                    st["failed"].append(f"EP {num}: {str(e)[:90]}")
+                    streak += 1
+                    if streak >= 3:
+                        st["aborted"] = str(e)[:200]
+                        break
+                if time.time() - last_edit > 15:
+                    last_edit = time.time()
+                    await show()
+        finally:
+            st["finished"] = True
+            await show()
+
+    async def _bulk_episode(self, task, ep, num, st):
+        files = ep.get("files") or []
+        if not files:
+            return
+        force = st["force"]
+        await self._make_links(task, ep, files, num, force=force, stats=st)
+        pch, ech = task.get("post_channel"), task["episode_channel"]
+        if not pch or not ep.get("ep_msg"):
+            return
+        if ep.get("post_msg"):
+            if not force:
+                return
+            try:  # the post already exists: swap in the new links (the blurred image stays)
+                await self._tg(self.app.edit_message_reply_markup, pch["id"], ep["post_msg"], self._link_kb(files))
+                return
+            except Exception as e:
+                msg_gone = any(x in str(e).upper() for x in ("MESSAGE_ID_INVALID", "MESSAGE_NOT_FOUND", "MESSAGE_EMPTY"))
+                if "NOT_MODIFIED" in str(e).upper():
+                    return
+                if not msg_gone:
+                    raise
+        # same post as the episode channel one, but its buttons are the generated links and the image is blurred
+        cm = await self._tg(self.app.get_messages, ech["id"], ep["ep_msg"])
+        kb = self._link_kb(files)
+        text = (cm.caption.html if cm.caption else (cm.text.html if cm.text else "")) or "."
+        d = os.path.join(self.d.download_dir, "pl_" + uuid.uuid4().hex[:8])
+        try:
+            pimg = None
+            if cm.photo:
+                os.makedirs(d, exist_ok=True)
+                src = await self._tg(self.app.download_media, cm, file_name=os.path.join(d, "src.jpg"))
+                pimg = await self._blur(src, d) if src else None
+            msg, _ = await self._send_post(pch, text, pimg, kb)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        await self.db.set_episode(task["_id"], ep["url"], post_msg=msg.id)
+
+    @staticmethod
+    def _footer(l1, l2):
+        e = lambda u: T.html.escape(u, quote=True)
+        s = f'\n\n🔗 <a href="{e(l1)}">File Share Link</a>'
+        return s + (f' · <a href="{e(l2)}">Public Earn Link</a>' if l2 else "")
+
+    async def _file_caption(self, tpl, base, ep_num, f, l1, l2):
+        """New file-channel caption: the admin's file template with {link1}/{link2}; links are appended when it has none."""
+        if base:
+            vals = {**base, "episode": ep_num, "quality": f["label"], "size": human_size(f["size"]),
+                    "link1": l1, "link2": l2 or "", "link": l2 or l1}
+            if T.has_links(tpl):
+                return T.render(tpl, vals, 1000)
+            return T.render(tpl, vals, 930) + self._footer(l1, l2)
+        cur = None  # no series data: keep the caption the file has now (minus an older link footer) and add the links
+        try:
+            cm = await self._tg(self.app.get_messages, f["chat"], f["msg"])
+            cur = cm.caption.html if cm and cm.caption else None
+        except Exception as e:
+            log.warning("could not read caption: %s", e)
+        cur = cur or f.get("cap")
+        if not cur:
+            return None
+        cur = re.sub(r"\s*🔗 <a href=\"[^\"]*\">File Share Link</a>.*$", "", cur, flags=re.S)
+        return cur + self._footer(l1, l2)
+
+    async def _blur(self, src, d):
+        """Blurred copy of the thumbnail for the post channel; None when blurring fails (post goes out without the image)."""
+        if not config.BLUR_ENABLED:
+            return src
+        out = os.path.join(d or os.path.dirname(src), "blur.jpg")
+        try:
+            n = await asyncio.to_thread(blur_image, src, out)
+            log.info("post thumbnail: %d area(s) blurred", n)
+            return out
+        except Exception as e:
+            log.warning("blur failed, posting without the image: %s", e)
+            return None
+
+    async def _make_links(self, task, ep, files, ep_num, base=None, force=False, stats=None):
+        tid = task["_id"]
+        ub = await self.db.userbot()
+        if not ub:
+            raise RuntimeError("no userbot logged in - send /userbot to the bot and log in")
+        if base is None and ep.get("series"):
+            srow = await self.db.series(tid, ep["series"])
+            if srow:
+                base = series_values(srow, len(await self.db.episodes_of(tid, ep["series"])))
+        tpl = await self.db.template("file")
+        for f in files:
+            if f.get("link1") and not force:   # force = make new links and replace the old ones everywhere
+                continue
+            self.current[tid] = f"EP {ep_num} · {f['label']} · generating link"
+            l1, l2 = await generate_links(ub["session"], config.API_ID, config.API_HASH,
+                                          task["link_bot1"], task.get("link_bot2"), f["chat"], f["msg"])
+            f["link1"], f["link2"] = l1, l2
+            await self.db.set_episode(tid, ep["url"], files=files)
+            cap = await self._file_caption(tpl, base, ep_num, f, l1, l2)
+            if cap:
+                try:
+                    await self._tg(self.app.edit_message_caption, f["chat"], f["msg"], cap, parse_mode=HTML)
+                    f["cap"] = cap
+                    await self.db.set_episode(tid, ep["url"], files=files)
+                    if stats is not None:
+                        stats["cap_ok"] += 1
+                except Exception as e:
+                    if "NOT_MODIFIED" in str(e).upper():
+                        if stats is not None:
+                            stats["cap_ok"] += 1
+                    else:
+                        log.warning("caption update failed (chat %s msg %s): %s", f["chat"], f["msg"], e)
+                        if stats is not None:
+                            stats["cap_fail"] += 1
+                            stats["cap_err"] = f"{type(e).__name__}: {str(e)[:140]}"
+            elif stats is not None:
+                stats["cap_fail"] += 1
+                stats["cap_err"] = "could not build the caption (no series data and no readable caption)"
 
     async def _transfer(self, task, res, link, base, ep_num, fch):
         tid, loop = task["_id"], asyncio.get_running_loop()
@@ -391,7 +610,7 @@ class Pipeline:
                                          f"uploading {cur * 100 // max(total, 1)}%")
 
                 vals = {**base, "episode": ep_num, "quality": link["label"], "size": human_size(size)}
-                cap = T.render(await self.db.template("file"), vals)
+                cap = T.render(T.without_links(await self.db.template("file")), vals, 1000)
                 if path.lower().endswith(VIDEO_EXT):
                     msg = await self._tg(self.app.send_video, fch["id"], path, caption=cap, parse_mode=HTML,
                                          duration=dur, thumb=thumb, supports_streaming=True, progress=prog)
@@ -399,7 +618,7 @@ class Pipeline:
                     msg = await self._tg(self.app.send_document, fch["id"], path, caption=cap, parse_mode=HTML,
                                          progress=prog)
                 return {"label": link["label"], "chat": fch["id"], "msg": msg.id, "size": size,
-                        "link": msg_link(fch, msg.id)}
+                        "link": msg_link(fch, msg.id), "cap": cap}
             finally:
                 shutil.rmtree(job_dir, ignore_errors=True)
 

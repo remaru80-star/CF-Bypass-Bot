@@ -24,6 +24,8 @@ import config
 from downloader import fetch, fetch_bytes, fetch_image
 import templating as T
 from pipeline import QUALITY_CHOICES, Pipeline, chan_name
+from userbot_links import (LoginError, drop_userbot, get_userbot, login_cancel, login_code, login_password,
+                           login_start)
 from scraper import SCRAPERS
 from store import Store
 
@@ -136,7 +138,8 @@ is_auth = filters.create(lambda _, __, m: bool(m.from_user) and _allowed(m.from_
 
 # /add_task and template editing are small step-by-step conversations, kept per admin
 WIZ: dict = {}
-TEXT_STEPS = ("link", "file", "episode", "sub", "tpl")
+TEXT_STEPS = ("link", "file", "episode", "sub", "tpl", "bot1", "bot2", "post", "ub_phone", "ub_code", "ub_pass",
+              "bk_bot1", "bk_bot2", "bk_post")
 in_wizard = filters.create(lambda _, __, m: bool(m.from_user) and WIZ.get(m.from_user.id, {}).get("step") in TEXT_STEPS)
 
 
@@ -900,7 +903,9 @@ ADMIN_COMMANDS = [
     ("set_episode_template", "Edit the episode post template"),
     ("set_file_template", "Edit the file caption template"),
     ("reset_templates", "Restore the default templates"),
-    ("cancel", "Cancel the current add_task / template edit"),
+    ("userbot", "Log in the userbot account (phone number) / show it"),
+    ("userbot_logout", "Remove the logged-in userbot account"),
+    ("cancel", "Cancel the current add_task / template edit / login"),
 ]
 ADMIN_NAMES = [c for c, _ in ADMIN_COMMANDS]
 is_admin = filters.create(lambda _, __, m: bool(m.from_user) and m.from_user.id in config.ADMIN_IDS)
@@ -968,6 +973,8 @@ STEP_TEXT = {
     "file": "📁 <b>File channel</b> — the video files are saved here.\n" + CH_HELP,
     "episode": "🎞 <b>Episode channel</b> — one post per episode, with a Download button.\n" + CH_HELP,
     "sub": "📚 <b>Sub channel</b> — one post per anime, with episode-number buttons.\n" + CH_HELP,
+    "post": "📣 <b>Post channel</b> — same post as the episode post, but the button is the generated link.\n" + CH_HELP,
+    "bot1": "🤖 <b>Link bot 1</b> — send its @username (the bot with /univarsal_link).",
 }
 STEP_ORDER = ["link", "download", "technique", "quality", "file", "episode", "sub", "confirm"]
 
@@ -980,6 +987,16 @@ async def wizard_ask(target, step):
     """Send the question for a step (buttons for the choice steps, plain text for the others)."""
     if step in STEP_TEXT:
         return await target.reply_text(STEP_TEXT[step] + "\n\n/cancel to stop.", parse_mode=HTML)
+    if step == "links":
+        return await target.reply_text("🔗 <b>Link generation</b> (optional)\nA userbot gets links for each file from your link bots "
+                                       "and posts in a post channel.", parse_mode=HTML,
+                                       reply_markup=kb_rows([[("✅ Set up", "wz|ln|yes"), ("⏭ Skip", "wz|ln|no")]]))
+    if step == "bot2":
+        return await target.reply_text("🤖 <b>Link bot 2</b> — send its @username (it turns bot 1's link into the final link).",
+                                       parse_mode=HTML, reply_markup=kb_rows([[("⏭ No bot 2", "wz|b2|skip")]]))
+    if step == "confirm":
+        return await target.reply_text(wizard_summary(w_data(target)), parse_mode=HTML,
+                                       reply_markup=kb_rows([[("✅ Start the task", "wz|go"), ("❌ Cancel", "wz|cancel")]]))
     if step == "download":
         return await target.reply_text("⬇️ <b>Download</b>", parse_mode=HTML,
                                        reply_markup=kb_rows([[("✅ All", "wz|dl|all"), ("Custom (off for now)", "wz|dl|custom")]]))
@@ -994,12 +1011,18 @@ async def wizard_ask(target, step):
     return None
 
 
+def w_data(target):
+    return WIZ[target.chat.id]["data"]
+
+
 def wizard_summary(d):
     tech = "Data Collect" if d["technique"] == "collect" else "One by one"
     return ("📝 <b>Check the task</b>\n"
             f"🔗 {esc(d['link'])} ({d['kind']})\n⬇️ Download: All · ⚙️ {tech} · 🎚 {d['quality']}\n"
             f"📁 File: {esc(chan_name(d['file']))}\n🎞 Episode: {esc(chan_name(d['episode']))}\n"
-            f"📚 Sub: {esc(chan_name(d['sub']))}")
+            f"📚 Sub: {esc(chan_name(d['sub']))}"
+            + (f"\n👤 Userbot: set · 🤖 {esc(d['link_bot1'])}" + (f" → {esc(d['link_bot2'])}" if d.get("link_bot2") else "")
+               + f"\n📣 Post: {esc(chan_name(d['post']))}" if d.get("link_bot1") else ""))
 
 
 async def resolve_channel(text):
@@ -1041,7 +1064,68 @@ async def add_task_cmd(_, m):
 
 @app.on_message(filters.command("cancel") & filters.private & is_admin)
 async def cancel_cmd(_, m):
+    await login_cancel(m.from_user.id)
     await m.reply_text("Cancelled. 👍" if WIZ.pop(m.from_user.id, None) else "Nothing to cancel.")
+
+
+# ---- userbot account login: phone -> code -> (2FA password); the session is kept in MongoDB and shared by all tasks
+@app.on_message(filters.command("userbot") & filters.private & is_admin)
+async def userbot_cmd(_, m):
+    if not await pipe_ready(m):
+        return
+    ub = await DB.userbot()
+    new = len(m.command) > 1 and m.command[1].lower() == "new"
+    if ub and not new:
+        return await m.reply_text(f"👤 Userbot: <b>{esc(ub.get('name') or '')}</b> (id {ub.get('id')})\n"
+                                  "Log in another account: /userbot new · remove: /userbot_logout", parse_mode=HTML)
+    WIZ[m.from_user.id] = {"step": "ub_phone", "data": {}}
+    await m.reply_text("📱 <b>Userbot login</b>\nSend the account's phone number with country code, e.g. <code>+919876543210</code>.\n"
+                       "Use a spare account, not your main one. /cancel to stop.", parse_mode=HTML)
+
+
+@app.on_message(filters.command("userbot_logout") & filters.private & is_admin)
+async def userbot_logout_cmd(_, m):
+    if not await pipe_ready(m):
+        return
+    ub = await DB.userbot()
+    if not ub:
+        return await m.reply_text("No userbot is logged in.")
+    await drop_userbot(ub["session"])
+    await DB.clear_userbot()
+    await m.reply_text("✅ Userbot removed. Tasks with link generation will fail until you log in again with /userbot.")
+
+
+async def userbot_login_step(m, w, step, text):
+    uid = m.from_user.id
+    try:
+        await m.delete()  # phone / code / password should not stay in the chat
+    except Exception:
+        pass
+    try:
+        if step == "ub_phone":
+            await login_start(uid, re.sub(r"[^\d+]", "", text), config.API_ID, config.API_HASH)
+            w["step"] = "ub_code"
+            return await m.reply_text("📲 Telegram sent a code to that account. Send it with spaces or dashes between the digits "
+                                      "(like <code>1 2 3 4 5</code>) — Telegram cancels codes typed as plain digits.", parse_mode=HTML)
+        if step == "ub_code":
+            res = await login_code(uid, re.sub(r"\D", "", text))
+        else:
+            res = await login_password(uid, text)
+    except LoginError as e:
+        if not e.retry:
+            WIZ.pop(uid, None)
+        return await m.reply_text(f"❌ {esc(str(e))}" + (" Send it again." if e.retry else " Start again with /userbot."), parse_mode=HTML)
+    if res[0] == "password":
+        w["step"] = "ub_pass"
+        return await m.reply_text("🔐 This account has two-step verification. Send its password.")
+    session, me = res[1], res[2]
+    old = await DB.userbot()
+    if old:
+        await drop_userbot(old["session"])
+    await DB.set_userbot(session, me.first_name or "", me.id)
+    WIZ.pop(uid, None)
+    await m.reply_text(f"✅ Userbot logged in: <b>{esc(me.first_name or '')}</b> (id {me.id}).\n"
+                       "Add it to your file channel, then use /add_task → Link generation.", parse_mode=HTML)
 
 
 @app.on_message(filters.private & filters.text & ~filters.regex(r"^/") & is_admin & in_wizard)
@@ -1065,7 +1149,49 @@ async def wizard_text(_, m):
         w["step"] = "download"
         return await wizard_ask(m, "download")
 
-    if step in ("file", "episode", "sub"):
+    if step in ("ub_phone", "ub_code", "ub_pass"):
+        return await userbot_login_step(m, w, step, text)
+
+    if step in ("bk_bot1", "bk_bot2"):
+        uname = text.lstrip("@").split("/")[-1]
+        try:
+            ub = await get_userbot((await DB.userbot())["session"], config.API_ID, config.API_HASH)
+            await ub.get_chat(uname)
+        except Exception as e:
+            return await m.reply_text(f"❌ The userbot can't find @{esc(uname)} ({esc(str(e)[:150])}). Send it again.", parse_mode=HTML)
+        d["link_bot1" if step == "bk_bot1" else "link_bot2"] = uname
+        w["step"] = "bk_bot2" if step == "bk_bot1" else "bk_post"
+        await m.reply_text(f"✅ {step.replace('bk_bot', 'Link bot ')}: @{esc(uname)}", parse_mode=HTML)
+        return await bulk_ask(m, w["step"])
+
+    if step == "bk_post":
+        try:
+            chat = await resolve_channel(text)
+        except Exception as e:
+            return await m.reply_text(f"❌ I can't find that channel ({esc(str(e))}). Make me an admin there and send it again.",
+                                      parse_mode=HTML)
+        ch, err = await check_channel(chat)
+        if err:
+            return await m.reply_text(err, parse_mode=HTML)
+        await DB.set_task(d["tid"], link_bot1=d["link_bot1"], link_bot2=d.get("link_bot2"), post_channel=ch)
+        w["step"] = "bk_first"
+        await m.reply_text(f"✅ Post channel: {esc(chan_name(ch))}\nLink generation is now also ON for this task's remaining episodes.",
+                           parse_mode=HTML)
+        return await bulk_ask(m, "bk_first")
+
+    if step in ("bot1", "bot2"):
+        uname = text.lstrip("@").split("/")[-1]
+        try:
+            ub = await get_userbot((await DB.userbot())["session"], config.API_ID, config.API_HASH)
+            chat = await ub.get_chat(uname)
+        except Exception as e:
+            return await m.reply_text(f"❌ The userbot can't find @{esc(uname)} ({esc(str(e)[:150])}). Send it again.", parse_mode=HTML)
+        d["link_bot1" if step == "bot1" else "link_bot2"] = uname
+        w["step"] = "bot2" if step == "bot1" else "post"
+        await m.reply_text(f"✅ {step.replace('bot', 'Link bot ')}: @{esc(uname)}", parse_mode=HTML)
+        return await wizard_ask(m, w["step"])
+
+    if step in ("file", "episode", "sub", "post"):
         try:
             chat = await resolve_channel(text)
         except Exception as e:
@@ -1075,7 +1201,7 @@ async def wizard_text(_, m):
         if err:
             return await m.reply_text(err, parse_mode=HTML)
         d[step] = ch
-        nxt = {"file": "episode", "episode": "sub", "sub": "confirm"}[step]
+        nxt = {"file": "episode", "episode": "sub", "sub": "links", "post": "confirm"}[step]
         w["step"] = nxt
         await m.reply_text(f"✅ {step.capitalize()} channel: {esc(chan_name(ch))}", parse_mode=HTML)
         if nxt == "confirm":
@@ -1110,12 +1236,29 @@ async def on_wizard(_, cq):
     elif act == "q":
         d["quality"], w["step"] = arg, "file"
         await safe_edit(cq.message, f"🎚 Quality: <b>{esc(arg)}</b>", parse_mode=HTML)
+    elif act == "ln":
+        if arg == "yes":
+            ub = await DB.userbot()
+            if not ub:
+                return await cq.answer("No userbot is logged in yet. Send /userbot, log in, then press Set up again.", show_alert=True)
+            w["step"] = "bot1"
+            await safe_edit(cq.message, f"🔗 Link generation: <b>set up</b>\n👤 Userbot: {esc(ub.get('name') or '')} (id {ub.get('id')})",
+                            parse_mode=HTML)
+        else:
+            w["step"] = "confirm"
+            await safe_edit(cq.message, "🔗 Link generation: <b>skipped</b>", parse_mode=HTML)
+    elif act == "b2":
+        d["link_bot2"], w["step"] = None, "post"
+        await safe_edit(cq.message, "🤖 Link bot 2: <b>none</b>", parse_mode=HTML)
     elif act == "go":
         if w["step"] != "confirm":
             return await cq.answer("Finish the questions first.", show_alert=True)
         tid = await PIPE.add_task({"admin_id": uid, "link": d["link"], "kind": d["kind"], "download": d["download"],
                                    "technique": d["technique"], "quality": d["quality"], "file_channel": d["file"],
-                                   "episode_channel": d["episode"], "sub_channel": d["sub"]})
+                                   "episode_channel": d["episode"], "sub_channel": d["sub"],
+                                   **({"link_bot1": d["link_bot1"],
+                                       "link_bot2": d.get("link_bot2"), "post_channel": d["post"]}
+                                      if d.get("link_bot1") else {})})
         WIZ.pop(uid, None)
         await safe_edit(cq.message, f"✅ <b>Task #{tid} started.</b>\n/tasks shows the progress.", parse_mode=HTML)
         return await cq.answer("Started")
@@ -1149,6 +1292,7 @@ async def task_view(tid):
     top = [("⏸ Pause", f"tk|pause|{tid}")] if t["status"] == "running" else (
         [("▶️ Resume", f"tk|resume|{tid}")] if t["status"] == "paused" else [])
     rows = ([top] if top else []) + [[("🔁 Retry failed", f"tk|retry|{tid}"), ("🔄 Refresh", f"tk|open|{tid}")],
+                                     [("🔗 Bulk links (old files)", f"tk|bulk|{tid}")],
                                      [("🗑 Delete", f"tk|del|{tid}"), ("⬅️ Back", "tk|list|0")]]
     return await PIPE.status_text(tid), kb_rows(rows)
 
@@ -1183,6 +1327,19 @@ async def on_task_button(_, cq):
     elif act == "retry":
         n = await PIPE.retry(tid)
         note = f"{n} episode(s) queued again" if n else "Nothing failed"
+    elif act == "bulk":
+        t = await DB.task(tid)
+        if not t:
+            return await cq.answer("Task not found", show_alert=True)
+        if not await DB.userbot():
+            return await cq.answer("Log in the userbot first: /userbot", show_alert=True)
+        run = PIPE.bulk.get(tid)
+        if run and not run["finished"]:
+            return await cq.answer("A bulk run is already going for this task", show_alert=True)
+        step = "bk_first" if t.get("link_bot1") else "bk_bot1"
+        WIZ[cq.from_user.id] = {"step": step, "data": {"tid": tid}}
+        await cq.answer()
+        return await bulk_ask(cq.message, step)
     elif act == "del":
         await safe_edit(cq.message, f"🗑 Delete task #{tid} and its saved data? Posts already made stay in the channels.",
                         reply_markup=kb_rows([[("Yes, delete", f"tk|delok|{tid}"), ("No", f"tk|open|{tid}")]]))
@@ -1195,6 +1352,127 @@ async def on_task_button(_, cq):
     text, kb = await task_view(tid)
     await safe_edit(cq.message, text, parse_mode=HTML, reply_markup=kb)
     await cq.answer(note)
+
+
+# ------------------------------------------------------------------ bulk links for old files
+BK_TEXT = {
+    "bk_bot1": "🔗 <b>Bulk links</b> — this task has no link bots yet.\n🤖 <b>Link bot 1</b>: send its @username (the file-share bot with /univarsal_link).",
+    "bk_post": "📣 <b>Post channel</b> — same post as the episode post, but the button is the generated link.\n" + CH_HELP,
+    "bk_first": "⏮ Forward me the <b>FIRST</b> file message (the earliest file to get a link) from the file channel, or send its message link.",
+    "bk_last": "⏭ Now forward the <b>LAST</b> file message (the newest one to get a link), or send its message link.",
+}
+
+
+async def bulk_ask(target, step):
+    if step == "bk_bot2":
+        return await target.reply_text("🤖 <b>Link bot 2</b>: send its @username (turns bot 1's link into the final link).",
+                                       parse_mode=HTML, reply_markup=kb_rows([[("⏭ No bot 2", "bk|b2skip")]]))
+    await target.reply_text(BK_TEXT[step] + "\n\n/cancel to stop.", parse_mode=HTML)
+
+
+def fwd_info(m):
+    """(chat id or @username, message id) of a forwarded channel message, or of a t.me link in the text."""
+    ch, mid = getattr(m, "forward_from_chat", None), getattr(m, "forward_from_message_id", None)
+    if ch and mid:
+        return ch.id, mid
+    o = getattr(m, "forward_origin", None)
+    if o and getattr(o, "chat", None) and getattr(o, "message_id", None):
+        return o.chat.id, o.message_id
+    t = m.text or ""
+    r = re.search(r"t\.me/c/(\d+)/(\d+)", t)
+    if r:
+        return int("-100" + r.group(1)), int(r.group(2))
+    r = re.search(r"t\.me/([A-Za-z0-9_]{4,})/(\d+)", t)
+    if r:
+        return "@" + r.group(1), int(r.group(2))
+    return None
+
+
+in_bulk = filters.create(lambda _, __, m: bool(m.from_user) and WIZ.get(m.from_user.id, {}).get("step") in ("bk_first", "bk_last"))
+
+
+async def bulk_range(m):
+    w = WIZ[m.from_user.id]
+    d = w["data"]
+    t = await DB.task(d["tid"])
+    info = fwd_info(m)
+    if not t or not info:
+        return await m.reply_text("❌ Forward the file message from the file channel (or send its message link).")
+    chat, mid = info
+    if isinstance(chat, str):
+        try:
+            chat = (await app.get_chat(chat)).id
+        except Exception:
+            return await m.reply_text("❌ I can't read that channel link. Forward the message instead.")
+    if chat != t["file_channel"]["id"]:
+        return await m.reply_text(f"❌ That message is not from this task's file channel ({esc(chan_name(t['file_channel']))}).",
+                                  parse_mode=HTML)
+    if w["step"] == "bk_first":
+        d["first"], w["step"] = mid, "bk_last"
+        await m.reply_text(f"✅ First file: message {mid}")
+        return await bulk_ask(m, "bk_last")
+    if mid < d["first"]:
+        return await m.reply_text("❌ The last message must come after the first one. Forward it again.")
+    d["last"] = mid
+    eps = await PIPE.bulk_plan(d["tid"], d["first"], d["last"])
+    files = [f for e in eps for f in e["files"]]
+    todo = sum(1 for f in files if not f.get("link1"))
+    if not eps:
+        WIZ.pop(m.from_user.id, None)
+        return await m.reply_text("No finished episodes of this task have files in that range.")
+    w["step"] = "bk_confirm"
+    lo, hi = todo * 20 / 3600, todo * 60 / 3600
+    await m.reply_text(
+        f"🔗 <b>Bulk links · task #{d['tid']}</b>\nMessages {d['first']} → {d['last']}\n"
+        f"Episodes: {len(eps)} · files: {len(files)} (already have links: {len(files) - todo})\n"
+        f"Rough time: {lo:.1f}–{hi:.1f} h for {todo} files, or {len(files) * 20 / 3600:.1f}–{len(files) * 60 / 3600:.1f} h for all "
+        "(about 20–60 s per file).\n\n"
+        "For each episode: new links via the userbot → file caption rebuilt with them → post channel post made (blurred image, "
+        "buttons = final link) or its buttons replaced if it already exists. Episode and sub channel posts stay as they are.",
+        parse_mode=HTML, reply_markup=kb_rows([[("🔄 Start · replace ALL links", "bk|go")],
+                                               [("➕ Only files without links", "bk|new")],
+                                               [("❌ Cancel", "bk|cancel")]]))
+
+
+@app.on_message(filters.private & is_admin & in_bulk & ~filters.regex(r"^/"), group=-1)
+async def bulk_range_msg(_, m):
+    await bulk_range(m)
+    m.stop_propagation()
+
+
+@app.on_callback_query(filters.regex(r"^bk\|"))
+async def on_bulk_button(_, cq):
+    uid = cq.from_user.id
+    if uid not in config.ADMIN_IDS:
+        return await cq.answer("Admin only", show_alert=True)
+    parts = cq.data.split("|")
+    act = parts[1]
+    if act == "stop":
+        ok = PIPE.bulk_stop(int(parts[2]))
+        return await cq.answer("Stopping after the current episode" if ok else "Not running")
+    w = WIZ.get(uid)
+    if not w:
+        return await cq.answer("This setup expired. Open /tasks again.", show_alert=True)
+    d = w["data"]
+    if act == "cancel":
+        WIZ.pop(uid, None)
+        await safe_edit(cq.message, "Cancelled.")
+        return await cq.answer()
+    if act == "b2skip" and w["step"] == "bk_bot2":
+        d["link_bot2"], w["step"] = None, "bk_post"
+        await safe_edit(cq.message, "🤖 Link bot 2: <b>none</b>", parse_mode=HTML)
+        await cq.answer()
+        return await bulk_ask(cq.message, "bk_post")
+    if act in ("go", "new") and w["step"] == "bk_confirm":
+        WIZ.pop(uid, None)
+        prog = await cq.message.reply_text("🔗 Bulk links starting…")
+        try:
+            await PIPE.bulk_start(d["tid"], d["first"], d["last"], prog.chat.id, prog.id, force=(act == "go"))
+        except Exception as e:
+            return await prog.edit_text(f"❌ {esc(str(e))}", parse_mode=HTML)
+        await safe_edit(cq.message, "✅ Started — progress is in the next message.")
+        return await cq.answer()
+    await cq.answer()
 
 
 # ------------------------------------------------------------------ templates

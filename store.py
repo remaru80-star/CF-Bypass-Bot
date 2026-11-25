@@ -19,6 +19,7 @@ class Store:
         self.db = db
         self.tasks, self.series_c, self.eps = db["tasks"], db["series"], db["episodes"]
         self.tpl, self.counters = db["templates"], db["counters"]
+        self.settings = db["settings"]
 
     async def init(self):
         await self.series_c.create_index([("task", 1), ("url", 1)], unique=True)
@@ -34,6 +35,16 @@ class Store:
         d = await self.counters.find_one_and_update({"_id": name}, {"$inc": {"n": 1}}, upsert=True,
                                                     return_document=ReturnDocument.AFTER)
         return d["n"]
+
+    # ---- userbot account (one login shared by every task)
+    async def userbot(self):
+        return await self.settings.find_one({"_id": "userbot"})
+
+    async def set_userbot(self, session, name, uid):
+        await self.settings.update_one({"_id": "userbot"}, {"$set": {"session": session, "name": name, "id": uid}}, upsert=True)
+
+    async def clear_userbot(self):
+        await self.settings.delete_one({"_id": "userbot"})
 
     # ---- templates
     async def template(self, name):

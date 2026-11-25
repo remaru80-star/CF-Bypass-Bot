@@ -41,6 +41,8 @@ DEFAULT_TEMPLATES = {
         "<➣ EPISODE :> {episode} / {total_episode}\n"
         "<➥ QUALITY :> {quality}\n"
         "<➥ SIZE :> {size}\n"
+        "<➥ FILE SHARE LINK :> {link1}\n"
+        "<➥ PUBLIC EARN LINK :> {link2}\n"
         "<➥ TYPE :> {catagory}\n"
         "<➥ AVERAGE RATING :> {rating}\n"
         "<➥AIRED ON:> {aired_on}\n"
@@ -68,13 +70,29 @@ VARIABLES = {
     "quality": "quality of the file(s)",
     "size": "file size(s)",
     "ep_title": "episode page title",
+    "link1": "file share link (made by link bot 1) - file caption only",
+    "link2": "public earn link (made by link bot 2) - file caption only",
+    "link": "the final link (link 2, or link 1 when there is no bot 2) - file caption only",
 }
 ALIASES = {"category": "catagory", "type": "catagory"}
 
 _TOKEN = re.compile(r"(</?q>|</?(?:b|i|u|s|code)>|<[^<>]*>)", re.I)
 _PASS = re.compile(r"^</?(?:b|i|u|s|code)>$", re.I)
-_LINK = re.compile(r"\[([^\]]+)\]\(((?:https?|tg)://[^)\s]+)\)")
+_LINK = re.compile(r"\[([^\]]+)\]\(((?:https?|tg)://[^)\s]+|\{\w+\})\)")  # [label](https://...) or [label]({link1})
+_LINKVAR = re.compile(r"\{link[12]?\}")
 _VAR = re.compile(r"\{(\w+)\}")
+
+
+def has_links(tpl):
+    return bool(_LINKVAR.search(tpl or ""))
+
+
+def without_links(tpl):
+    """The template as it looks before the links exist: lines that use {link1}/{link2}/{link} are left out."""
+    kept = "\n".join(l for l in (tpl or "").split("\n") if not _LINKVAR.search(l))
+    if len(re.findall(r"<q>", kept, re.I)) != len(re.findall(r"</q>", kept, re.I)):  # a quote tag sat on a link line
+        return _LINKVAR.sub("https://t.me/", tpl)
+    return kept
 
 
 def clip(s, n):
